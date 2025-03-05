@@ -73,11 +73,11 @@ public class SignalRGAgent :
                 var connectionIdList = State.ConnectionIds;
                 foreach (var (connectionId, fireAndForget) in connectionIdList)
                 {
-                    Logger.LogInformation($"[SignalRGAgent][SendWithRetryAsync]-->start,message->{JsonConvert.SerializeObject(message)}");
+                    Logger.LogInformation($"[SignalRGAgent][SendWithRetryAsync]-->start,connectionId->{connectionId} message->{JsonConvert.SerializeObject(message)}");
                     await _hubContext.Client(connectionId)
                         .Send(SignalROrleansConstants.MethodName, JsonConvert.SerializeObject(message));
                     
-                    Logger.LogInformation($"[SignalRGAgent][SendWithRetryAsync]-->end,message->{JsonConvert.SerializeObject(message)}");
+                    Logger.LogInformation($"[SignalRGAgent][SendWithRetryAsync]-->end,connectionId->{connectionId} message->{JsonConvert.SerializeObject(message)}");
                     if (fireAndForget)
                     {
                         RaiseEvent(new RemoveConnectionIdStateLogEvent
