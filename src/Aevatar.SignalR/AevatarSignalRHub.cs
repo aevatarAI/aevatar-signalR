@@ -12,11 +12,32 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 {
     private readonly IGAgentFactory _gAgentFactory;
     private readonly ILogger<AevatarSignalRHub> _logger;
+    private static readonly ConcurrentDictionary<string, string> UserIdToConnectionId = new();
+    private static readonly ConcurrentDictionary<string, string> ConnectionIdToUserId = new();
+    private static readonly ConcurrentDictionary<string, GrainId> UserIdToSignalRGAgent = new();
 
     public AevatarSignalRHub(IGAgentFactory gAgentFactory, ILogger<AevatarSignalRHub> logger)
     {
         _gAgentFactory = gAgentFactory;
         _logger = logger;
+    }
+
+    // Add a method for user identification
+    public async Task IdentifyUserAsync(string userId)
+    {
+        var connectionId = GetConnectionId();
+        _logger.LogInformation("Identifying user {UserId} with connection {ConnectionId}", userId, connectionId);
+        
+        // Store the mapping
+        UserIdToConnectionId[userId] = connectionId;
+        ConnectionIdToUserId[connectionId] = userId;
+        
+        // If this user has a previous SignalR agent, reconnect them
+        if (UserIdToSignalRGAgent.TryGetValue(userId, out var signalRGAgentId))
+        {
+            var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentId.GetGuidKey());
+            await signalRGAgent.ReconnectUserAsync(userId, connectionId);
+        }
     }
 
     public async Task<GrainId?> PublishEventAsync(GrainId grainId, string eventTypeName, string eventJson)
@@ -30,6 +51,14 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
+        
+        // Store the SignalR agent for this user (if they are identified)
+        if (ConnectionIdToUserId.TryGetValue(connectionId, out var userId))
+        {
+            UserIdToSignalRGAgent[userId] = signalRGAgent.GetGrainId();
+            await signalRGAgent.RegisterUserAsync(userId, connectionId);
+        }
+        
         await parentGAgent.RegisterAsync(signalRGAgent);
         _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
         await signalRGAgent.PublishEventAsync(DeserializeEvent(eventTypeName, eventJson), connectionId);
@@ -48,6 +77,14 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
+        
+        // Store the SignalR agent for this user (if they are identified)
+        if (ConnectionIdToUserId.TryGetValue(connectionId, out var userId))
+        {
+            UserIdToSignalRGAgent[userId] = signalRGAgent.GetGrainId();
+            await signalRGAgent.RegisterUserAsync(userId, connectionId);
+        }
+        
         await parentGAgent.RegisterAsync(signalRGAgent);
         _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
         await signalRGAgent.PublishEventAsync(DeserializeEvent(eventTypeName, eventJson), connectionId);
@@ -116,8 +153,20 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
+        var connectionId = GetConnectionId();
+        
+        // Get the user ID (if any) associated with this connection
+        if (ConnectionIdToUserId.TryGetValue(connectionId, out var userId))
+        {
+            // We don't remove the userId->connectionId mapping as we want to remember that this user had this connection
+            // Only clear the connectionId->userId mapping
+            ConnectionIdToUserId.TryRemove(connectionId, out _);
+            
+            _logger.LogInformation("User {UserId} disconnected with connection {ConnectionId}", userId, connectionId);
+        }
+        
         await base.OnDisconnectedAsync(exception);
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, Guid.Empty.ToString());
+        await Groups.RemoveFromGroupAsync(connectionId, Guid.Empty.ToString());
     }
 }
 

@@ -11,6 +11,8 @@ public class SignalRGAgentState : StateBase
 {
     [Id(1)] public Dictionary<string, bool> ConnectionIds { get; set; } = new();
     [Id(2)] public Dictionary<Guid, string> ConnectionIdMap { get; set; } = new();
+    [Id(3)] public Dictionary<string, string> UserConnectionMap { get; set; } = new(); // Maps userId -> connectionId
+    [Id(4)] public Dictionary<string, List<ResponseToPublisherEventBase>> PendingMessages { get; set; } = new(); // Maps userId -> pending messages
 }
 
 [GenerateSerializer]
@@ -65,6 +67,24 @@ public class SignalRGAgent :
     private async Task SendWithRetryAsync(object message)
     {
         const int maxRetries = 3;
+        var messageDelivered = false;
+        
+        // Try to find the user ID associated with the message for potential storage
+        string? userId = null;
+        if (message is AevatarSignalRResponse<ResponseToPublisherEventBase> response && 
+            response.Response?.ConnectionId != null)
+        {
+            // Try to find the user ID associated with this connection ID
+            foreach (var (user, conn) in State.UserConnectionMap)
+            {
+                if (conn == response.Response.ConnectionId)
+                {
+                    userId = user;
+                    break;
+                }
+            }
+        }
+        
         for (var i = 0; i < maxRetries; i++)
         {
             try
@@ -74,20 +94,37 @@ public class SignalRGAgent :
                 {
                     Logger.LogInformation("Sending message to connectionId: {ConnectionId}, Message {Message}", connectionId,
                         message);
-                    await _hubContext.Client(connectionId)
-                        .Send(SignalROrleansConstants.ResponseMethodName, message);
-                    if (fireAndForget)
+                    
+                    try
                     {
-                        Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", connectionId);
-                        RaiseEvent(new RemoveConnectionIdStateLogEvent
+                        await _hubContext.Client(connectionId)
+                            .Send(SignalROrleansConstants.ResponseMethodName, message);
+                        messageDelivered = true;
+                        
+                        if (fireAndForget)
                         {
-                            ConnectionId = connectionId
-                        });
-                        await ConfirmEvents();
+                            Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", connectionId);
+                            RaiseEvent(new RemoveConnectionIdStateLogEvent
+                            {
+                                ConnectionId = connectionId
+                            });
+                            await ConfirmEvents();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(ex, "Failed to send message to connectionId: {ConnectionId}", connectionId);
+                        // Connection might be broken, but we continue to try other connections
                     }
                 }
 
-                return;
+                if (messageDelivered)
+                {
+                    return;
+                }
+                
+                // If we get here, we couldn't deliver the message to any connection
+                await Task.Delay(1000 * (i + 1));
             }
             catch (Exception ex)
             {
@@ -96,6 +133,19 @@ public class SignalRGAgent :
                 else
                     await Task.Delay(1000 * (i + 1));
             }
+        }
+        
+        // If we couldn't deliver the message and we have a user ID, store it for later delivery
+        if (!messageDelivered && !string.IsNullOrEmpty(userId) && 
+            message is AevatarSignalRResponse<ResponseToPublisherEventBase> failedResponse)
+        {
+            Logger.LogInformation("Storing message for later delivery to user {UserId}", userId);
+            RaiseEvent(new StorePendingMessageStateLogEvent
+            {
+                UserId = userId,
+                Message = failedResponse.Response
+            });
+            await ConfirmEvents();
         }
     }
 
@@ -133,6 +183,71 @@ public class SignalRGAgent :
         RaiseEvent(new RemoveConnectionIdStateLogEvent
         {
             ConnectionId = connectionId
+        });
+        await ConfirmEvents();
+    }
+
+    public async Task RegisterUserAsync(string userId, string connectionId)
+    {
+        if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(connectionId))
+            return;
+
+        Logger.LogInformation("Registering user {UserId} with connection {ConnectionId}", userId, connectionId);
+        
+        RaiseEvent(new RegisterUserStateLogEvent
+        {
+            UserId = userId,
+            ConnectionId = connectionId
+        });
+        await ConfirmEvents();
+    }
+
+    public async Task ReconnectUserAsync(string userId, string newConnectionId)
+    {
+        if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(newConnectionId))
+            return;
+
+        Logger.LogInformation("Reconnecting user {UserId} with new connection {ConnectionId}", userId, newConnectionId);
+        
+        // Update the user's connection ID
+        RaiseEvent(new RegisterUserStateLogEvent
+        {
+            UserId = userId,
+            ConnectionId = newConnectionId
+        });
+        await ConfirmEvents();
+        
+        // Deliver any pending messages
+        await DeliverPendingMessagesAsync(userId, newConnectionId);
+    }
+
+    public async Task DeliverPendingMessagesAsync(string userId, string connectionId)
+    {
+        if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(connectionId))
+            return;
+
+        if (!State.PendingMessages.TryGetValue(userId, out var pendingMessages) || !pendingMessages.Any())
+        {
+            Logger.LogInformation("No pending messages for user {UserId}", userId);
+            return;
+        }
+
+        Logger.LogInformation("Delivering {Count} pending messages to user {UserId}", pendingMessages.Count, userId);
+        
+        foreach (var message in pendingMessages)
+        {
+            message.ConnectionId = connectionId;
+            await EnqueueMessageAsync(new AevatarSignalRResponse<ResponseToPublisherEventBase>
+            {
+                IsSuccess = true,
+                Response = message
+            });
+        }
+        
+        // Clear the pending messages for this user
+        RaiseEvent(new ClearPendingMessagesStateLogEvent
+        {
+            UserId = userId
         });
         await ConfirmEvents();
     }
@@ -218,6 +333,20 @@ public class SignalRGAgent :
                 State.ConnectionIdMap[mapCorrelationIdToConnectionIdStateLogEvent.CorrelationId] =
                     mapCorrelationIdToConnectionIdStateLogEvent.ConnectionId;
                 break;
+            case RegisterUserStateLogEvent registerUserStateLogEvent:
+                State.UserConnectionMap[registerUserStateLogEvent.UserId] = registerUserStateLogEvent.ConnectionId;
+                break;
+            case ClearPendingMessagesStateLogEvent clearPendingMessagesStateLogEvent:
+                State.PendingMessages.Remove(clearPendingMessagesStateLogEvent.UserId);
+                break;
+            case StorePendingMessageStateLogEvent storePendingMessageStateLogEvent:
+                if (!State.PendingMessages.TryGetValue(storePendingMessageStateLogEvent.UserId, out var messages))
+                {
+                    messages = new List<ResponseToPublisherEventBase>();
+                    State.PendingMessages[storePendingMessageStateLogEvent.UserId] = messages;
+                }
+                messages.Add(storePendingMessageStateLogEvent.Message);
+                break;
         }
     }
 
@@ -239,5 +368,25 @@ public class SignalRGAgent :
     {
         [Id(0)] public Guid CorrelationId { get; set; }
         [Id(1)] public string ConnectionId { get; set; }
+    }
+
+    [GenerateSerializer]
+    public class RegisterUserStateLogEvent : SignalRStateLogEvent
+    {
+        [Id(0)] public string UserId { get; set; } = string.Empty;
+        [Id(1)] public string ConnectionId { get; set; } = string.Empty;
+    }
+
+    [GenerateSerializer]
+    public class ClearPendingMessagesStateLogEvent : SignalRStateLogEvent
+    {
+        [Id(0)] public string UserId { get; set; } = string.Empty;
+    }
+
+    [GenerateSerializer]
+    public class StorePendingMessageStateLogEvent : SignalRStateLogEvent
+    {
+        [Id(0)] public string UserId { get; set; } = string.Empty;
+        [Id(1)] public ResponseToPublisherEventBase Message { get; set; }
     }
 }
