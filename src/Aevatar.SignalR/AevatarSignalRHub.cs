@@ -14,7 +14,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     private readonly ILogger<AevatarSignalRHub> _logger;
     private static readonly ConcurrentDictionary<string, string> UserIdToConnectionId = new();
     private static readonly ConcurrentDictionary<string, string> ConnectionIdToUserId = new();
-    private static readonly ConcurrentDictionary<string, GrainId> UserIdToSignalRGAgent = new();
+    // No need for UserIdToSignalRGAgent mapping as userId is already GrainId
 
     public AevatarSignalRHub(IGAgentFactory gAgentFactory, ILogger<AevatarSignalRHub> logger)
     {
@@ -31,13 +31,6 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         // Store the mapping
         UserIdToConnectionId[userId] = connectionId;
         ConnectionIdToUserId[connectionId] = userId;
-        
-        // If this user has a previous SignalR agent, reconnect them
-        if (UserIdToSignalRGAgent.TryGetValue(userId, out var signalRGAgentId))
-        {
-            var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentId.GetGuidKey());
-            await signalRGAgent.ReconnectUserAsync(userId, connectionId);
-        }
     }
 
     public async Task<GrainId?> PublishEventAsync(GrainId grainId, string eventTypeName, string eventJson)
@@ -45,20 +38,20 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         _logger.LogInformation($"PublishEventAsync: {grainId} \n{eventTypeName} \n{eventJson}");
         using var _ = new ActivityScope(nameof(PublishEventAsync));
 
+        // Get connection ID and check if there's an associated user ID
+        var connectionId = GetConnectionId();
+        // Ensure user relationship is initialized
+
         var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
         if (parentGAgent == null || signalRGAgent == null) return null;
 
-        var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
         
-        // Store the SignalR agent for this user (if they are identified)
-        if (ConnectionIdToUserId.TryGetValue(connectionId, out var userId))
-        {
-            UserIdToSignalRGAgent[userId] = signalRGAgent.GetGrainId();
-            await signalRGAgent.RegisterUserAsync(userId, connectionId);
-        }
+        var userId = grainId.ToString();
         
+        await IdentifyUserAsync(userId);
+
         await parentGAgent.RegisterAsync(signalRGAgent);
         _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
         await signalRGAgent.PublishEventAsync(DeserializeEvent(eventTypeName, eventJson), connectionId);
@@ -71,19 +64,17 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
         using var _ = new ActivityScope(nameof(SubscribeAsync));
 
+        // Get connection ID and check if there's an associated user ID
+        var connectionId = GetConnectionId();
+
         var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
         if (parentGAgent == null || signalRGAgent == null) return null;
 
-        var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
         
-        // Store the SignalR agent for this user (if they are identified)
-        if (ConnectionIdToUserId.TryGetValue(connectionId, out var userId))
-        {
-            UserIdToSignalRGAgent[userId] = signalRGAgent.GetGrainId();
-            await signalRGAgent.RegisterUserAsync(userId, connectionId);
-        }
+        var userId = grainId.ToString();
+        await IdentifyUserAsync(userId);
         
         await parentGAgent.RegisterAsync(signalRGAgent);
         _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
