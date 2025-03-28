@@ -63,7 +63,7 @@ public class SignalRGAgent :
         });
     }
 
-    private async Task SendWithRetryAsync(object message)
+    private async Task SendWithRetryAsync(ResponseToPublisherEventBase message)
     {
         const int maxRetries = 3;
         var messageDelivered = false;
@@ -73,10 +73,75 @@ public class SignalRGAgent :
             try
             {
                 var connectionIdList = State.ConnectionIds;
+                
+                // First try to use the ConnectionId from the message
+                if (!string.IsNullOrEmpty(message.ConnectionId) && connectionIdList.ContainsKey(message.ConnectionId))
+                {
+                    Logger.LogInformation("Trying to send message to specified connectionId: {ConnectionId}, Message {Message}", 
+                        message.ConnectionId, message);
+                    
+                    try 
+                    {
+                        await _hubContext.Client(message.ConnectionId)
+                            .Send(SignalROrleansConstants.ResponseMethodName, message);
+                        messageDelivered = true;
+                        
+                        if (connectionIdList[message.ConnectionId]) // If it's fireAndForget
+                        {
+                            Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", message.ConnectionId);
+                            RaiseEvent(new RemoveConnectionIdStateLogEvent
+                            {
+                                ConnectionId = message.ConnectionId
+                            });
+                            await ConfirmEvents();
+                        }
+                        
+                        return; // Message delivered, return immediately
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(ex, "Failed to send message to specified connectionId: {ConnectionId}", message.ConnectionId);
+                        // Continue to try other connections
+                    }
+                }
+                
+                // If specified ConnectionId doesn't exist or sending failed, try connections with fireAndForget=false
                 foreach (var (connectionId, fireAndForget) in connectionIdList)
                 {
-                    Logger.LogInformation("Sending message to connectionId: {ConnectionId}, Message {Message}", connectionId,
-                        message);
+                    // Skip already tried connectionId
+                    if (connectionId == message.ConnectionId)
+                        continue;
+                        
+                    // Only use connections with fireAndForget=false as backup
+                    if (!fireAndForget)
+                    {
+                        Logger.LogInformation("Trying to send message using persistent connection, connectionId: {ConnectionId}, Message {Message}", 
+                            connectionId, message);
+                        
+                        try
+                        {
+                            await _hubContext.Client(connectionId)
+                                .Send(SignalROrleansConstants.ResponseMethodName, message);
+                            messageDelivered = true;
+                            return; // Message delivered, return immediately
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogWarning(ex, "Failed to send message using persistent connection: {ConnectionId}", connectionId);
+                            // Continue to try other connections
+                        }
+                    }
+                }
+                
+                // If all above failed, try sending to all remaining connections
+                foreach (var (connectionId, fireAndForget) in connectionIdList)
+                {
+                    // Skip already tried connectionIds
+                    if (connectionId == message.ConnectionId || !fireAndForget)
+                        continue;
+                    
+                    Logger.LogInformation("Last attempt to send message to connectionId: {ConnectionId}, Message {Message}", 
+                        connectionId, message);
                     
                     try
                     {
@@ -84,20 +149,22 @@ public class SignalRGAgent :
                             .Send(SignalROrleansConstants.ResponseMethodName, message);
                         messageDelivered = true;
                         
+                        Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", connectionId);
                         if (fireAndForget)
                         {
-                            Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", connectionId);
                             RaiseEvent(new RemoveConnectionIdStateLogEvent
                             {
                                 ConnectionId = connectionId
                             });
                             await ConfirmEvents();
                         }
+
+                        return; // Message delivered, return immediately
                     }
                     catch (Exception ex)
                     {
-                        Logger.LogWarning(ex, "Failed to send message to connectionId: {ConnectionId}", connectionId);
-                        // Connection might be broken, but we continue to try other connections
+                        Logger.LogWarning(ex, "Failed to send message: {ConnectionId}", connectionId);
+                        // Continue to try other connections
                     }
                 }
 
@@ -106,8 +173,8 @@ public class SignalRGAgent :
                     return;
                 }
                 
-                // If we get here, we couldn't deliver the message to any connection
-                await Task.Delay(1000 * (i + 1));
+                // If we reach here, we couldn't deliver the message to any connection
+                await Task.Delay(100 * (i + 1));
             }
             catch (Exception ex)
             {
@@ -156,9 +223,12 @@ public class SignalRGAgent :
             FireAndForget = fireAndForget
         });
         await ConfirmEvents();
-
-        // After adding connection ID, try to deliver all pending messages
-        await DeliverPendingMessagesAsync(connectionId);
+        if (!fireAndForget)
+        {
+            // After adding connection ID, try to deliver all pending messages
+            await DeliverPendingMessagesAsync(connectionId);
+        }
+       
     }
 
     public async Task RemoveConnectionIdAsync(string connectionId)
