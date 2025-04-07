@@ -72,6 +72,7 @@ public class SignalRGAgent :
         {
             try
             {
+                Logger.LogInformation("Trying to send  Message : {Message}", message);
                 var connectionIdList = State.ConnectionIds;
                 
                 // First try to use the ConnectionId from the message
