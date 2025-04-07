@@ -90,9 +90,20 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     {
         var targetGAgent = await _gAgentFactory.GetGAgentAsync(grainId);
         var parentGrainId = await targetGAgent.GetParentAsync();
-        if (parentGrainId.IsDefault) return (null, null);
+        if (parentGrainId.IsDefault)
+        {
+            var signalRParentGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>();
+            var gAgent = await _gAgentFactory.GetGAgentAsync(grainId);
+            await signalRParentGAgent.RegisterAsync(gAgent);
+            return (signalRParentGAgent, signalRParentGAgent);
+        }
 
         var parentGAgent = await _gAgentFactory.GetGAgentAsync(parentGrainId);
+        if (parentGrainId.Type == GrainTypeCache.Get(typeof(SignalRGAgent)))
+        {
+            return (parentGAgent, await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(parentGrainId.GetGuidKey()));
+        }
+
         var signalRGAgent = await GetOrCreateSignalRGAgentAsync(parentGAgent);
         return (parentGAgent, signalRGAgent);
     }
@@ -138,6 +149,21 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
     public override async Task OnConnectedAsync()
     {
+        _logger.LogInformation(
+            "Client connecting - Connection Details:\n" +
+            "ConnectionId: {ConnectionId}\n" +
+            "User: {UserName}\n" +
+            "IsAuthenticated: {IsAuthenticated}\n" +
+            "Items Count: {ItemsCount}\n" +
+            "Claims: {Claims}",
+            Context.ConnectionId,
+            Context.User?.Identity?.Name ?? "Anonymous",
+            Context.User?.Identity?.IsAuthenticated ?? false,
+            Context.Items.Count,
+            Context.User?.Claims != null 
+                ? string.Join(", ", Context.User.Claims.Select(c => $"{c.Type}: {c.Value}"))
+                : "No claims");
+
         await base.OnConnectedAsync();
         await Groups.AddToGroupAsync(Context.ConnectionId, Guid.Empty.ToString());
     }
@@ -157,7 +183,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         }
         
         await base.OnDisconnectedAsync(exception);
-        await Groups.RemoveFromGroupAsync(connectionId, Guid.Empty.ToString());
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, Guid.Empty.ToString());
     }
 }
 
