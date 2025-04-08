@@ -21,6 +21,8 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
     private readonly ConcurrentDictionary<string, HubConnectionContext> _connections = new();
     private readonly ConcurrentDictionary<string, byte> _activeTransfers = new();
     private readonly int _maxParallelTransfers;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly TimeSpan _connectionTimeout = TimeSpan.FromSeconds(10);
 
     private IStreamProvider? _streamProvider;
     private IAsyncStream<ClientMessage> _serverStream = default!;
@@ -123,10 +125,10 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
             return Task.CompletedTask;
         
         var payload = allMessage.Message;
-        var allTasks = new List<Task>();
+        var tasks = new List<Task>();
         
-        // 获取连接的快照
-        var connections = _connections.Values.ToList();
+        // 创建连接的快照以避免枚举时修改集合
+        var connections = _connections.Values.ToArray();
         
         foreach (var connection in connections)
         {
@@ -135,12 +137,12 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
             if (allMessage.ExcludedIds == null || !allMessage.ExcludedIds.Contains(connection.ConnectionId))
             {
-                var task = SendLocal(connection, new ClientNotification(payload.Target, payload.Arguments!.ToStrings()));
-                allTasks.Add(task);
+                tasks.Add(SendLocal(connection, new ClientNotification(payload.Target, payload.Arguments!.ToStrings())));
             }
         }
 
-        return Task.WhenAll(allTasks);
+        // 避免为空列表创建Task.WhenAll
+        return tasks.Count > 0 ? Task.WhenAll(tasks) : Task.CompletedTask;
     }
 
     private Task ProcessServerMessage(ClientMessage clientMessage)
@@ -158,18 +160,33 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         return Task.CompletedTask;
     }
 
-    private async Task<bool> TryAcquireTransferSlot(string connectionId)
+    private async Task<bool> TryAcquireTransferSlot(string connectionId, TimeSpan timeout)
     {
         // 如果已存在，则已获取槽位
         if (_activeTransfers.TryGetValue(connectionId, out _))
             return true;
             
-        // 如果活动传输数已达上限，则拒绝新的传输
-        if (_activeTransfers.Count >= _maxParallelTransfers)
+        // 尝试获取连接锁
+        if (!await _connectionLock.WaitAsync(timeout))
             return false;
             
-        // 尝试添加新传输
-        return _activeTransfers.TryAdd(connectionId, 1);
+        try
+        {
+            // 再次检查，避免在获取锁的过程中状态变化
+            if (_activeTransfers.TryGetValue(connectionId, out _))
+                return true;
+                
+            // 如果活动传输数已达上限，则拒绝新的传输
+            if (_activeTransfers.Count >= _maxParallelTransfers)
+                return false;
+                
+            // 尝试添加新传输
+            return _activeTransfers.TryAdd(connectionId, 1);
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
     
     private void ReleaseTransferSlot(string connectionId)
@@ -189,13 +206,13 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         try
         {
             // 如果无法获取传输槽位，则延迟处理
-            if (!(await TryAcquireTransferSlot(connectionId)))
+            if (!(await TryAcquireTransferSlot(connectionId, _connectionTimeout)))
             {
                 _logger.LogWarning("Connection processing delayed due to high load: {connectionId}", connectionId);
-                await Task.Delay(100);
                 
-                // 再次尝试获取槽位
-                if (!(await TryAcquireTransferSlot(connectionId)))
+                // 重试一次
+                await Task.Delay(100);
+                if (!(await TryAcquireTransferSlot(connectionId, _connectionTimeout)))
                 {
                     throw new HubException("Server is currently handling too many connections. Please try again later.");
                 }
