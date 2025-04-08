@@ -70,6 +70,7 @@ public class SignalRGAgent :
             RaiseEvent(new ClearPendingMessagesStateLogEvent());
         }
         
+        // 使用旧版RegisterTimer方法，避免GrainTimerConfig引用问题
         _processQueueTimer = RegisterTimer(
             ProcessQueueTimerCallback,
             null,
@@ -79,7 +80,7 @@ public class SignalRGAgent :
         return Task.CompletedTask;
     }
 
-    private async Task ProcessQueueTimerCallback(object state)
+    private async Task ProcessQueueTimerCallback(object? state)
     {
         // 移除锁，Orleans已经保证了Grain的单线程执行
         // if (!await _processingLock.WaitAsync(0))
@@ -375,14 +376,14 @@ public class SignalRGAgent :
     [GenerateSerializer]
     public class AddConnectionIdStateLogEvent : SignalRStateLogEvent
     {
-        [Id(0)] public string ConnectionId { get; set; } = string.Empty;
+        [Id(0)] public required string ConnectionId { get; set; } = string.Empty;
         [Id(1)] public bool FireAndForget { get; set; } = true;
     }
 
     [GenerateSerializer]
     public class RemoveConnectionIdStateLogEvent : SignalRStateLogEvent
     {
-        [Id(0)] public string ConnectionId { get; set; } = string.Empty;
+        [Id(0)] public required string ConnectionId { get; set; } = string.Empty;
     }
 
     [GenerateSerializer]
@@ -395,7 +396,7 @@ public class SignalRGAgent :
     [GenerateSerializer]
     public class EnqueueMessageStateLogEvent : SignalRStateLogEvent
     {
-        [Id(0)] public ResponseToPublisherEventBase Message { get; set; }
+        [Id(0)] public required ResponseToPublisherEventBase Message { get; set; }
     }
 
     [GenerateSerializer]

@@ -438,8 +438,8 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
             {
                 try
                 {
-                    // 使用FireAndForgetExtension确保不阻塞
-                    client.GetServerDirectoryGrain().RemoveServer(_serverId).FireAndForget();
+                    // 直接调用，不使用FireAndForgetExtension
+                    client.GetServerDirectoryGrain().Unregister(_serverId);
                 }
                 catch (Exception ex)
                 {

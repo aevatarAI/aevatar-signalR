@@ -102,7 +102,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
             // 减少嵌套，优化异常处理流程
             var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
-            if (parentGAgent == null || signalRGAgent == null)
+            if (parentGAgent is null || signalRGAgent is null)
             {
                 _logger.LogWarning("PublishEventAsync: Failed to initialize group members for GrainId {GrainId}", grainId);
                 return null;
@@ -156,7 +156,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
             // 减少嵌套，优化异常处理流程
             var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
-            if (parentGAgent == null || signalRGAgent == null)
+            if (parentGAgent is null || signalRGAgent is null)
             {
                 _logger.LogWarning("SubscribeAsync: Failed to initialize group members for GrainId {GrainId}", grainId);
                 return null;
