@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading;
+using System.Threading.Tasks;
 using Aevatar.Core.Abstractions;
 using Aevatar.SignalR.GAgents;
 using Microsoft.AspNetCore.SignalR;
@@ -19,12 +20,15 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     // 使用AsyncLocal来自动关联到当前请求线程上下文
     private static readonly AsyncLocal<ProcessingState> _currentProcessingState = new();
     
-    // 使用对象池来减少临时对象的创建
+    // 使用对象池来减少临时对象的创建，增加池大小以支持更高并发
     private static readonly ObjectPool<SemaphoreSlim> _semaphorePool = 
-        new DefaultObjectPool<SemaphoreSlim>(new SemaphoreSlimPoolPolicy(), 50);
+        new DefaultObjectPool<SemaphoreSlim>(new SemaphoreSlimPoolPolicy(), 100);
         
-    // 使用较短的超时时间，避免长时间等待
-    private static readonly TimeSpan SemaphoreTimeout = TimeSpan.FromSeconds(10);
+    // 减少超时时间，避免长时间等待，优化用户体验
+    private static readonly TimeSpan SemaphoreTimeout = TimeSpan.FromSeconds(5);
+    
+    // 添加连接ID缓存，避免频繁创建和查询
+    private static readonly ConcurrentDictionary<string, byte> _activeConnections = new();
     
     private class SemaphoreSlimPoolPolicy : IPooledObjectPolicy<SemaphoreSlim>
     {
@@ -44,16 +48,19 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     {
         public SemaphoreSlim Semaphore { get; }
         public string ConnectionId { get; }
+        public CancellationTokenSource Cts { get; }
         
         public ProcessingState(SemaphoreSlim semaphore, string connectionId)
         {
             Semaphore = semaphore;
             ConnectionId = connectionId;
+            Cts = new CancellationTokenSource();
         }
         
         public void Dispose()
         {
             _semaphorePool.Return(Semaphore);
+            try { Cts.Dispose(); } catch { /* 忽略可能的异常 */ }
         }
     }
 
@@ -74,7 +81,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         {
             _semaphorePool.Return(semaphore);
             _logger.LogWarning("Timeout waiting for semaphore on connection {ConnectionId}", connectionId);
-            throw new HubException("Operation timed out due to high load. Please try again.");
+            throw new HubException("操作因负载过高而超时。请稍后重试。");
         }
         
         var state = new ProcessingState(semaphore, connectionId);
@@ -88,7 +95,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         if (string.IsNullOrEmpty(connectionId))
         {
             _logger.LogWarning("PublishEventAsync: Connection ID is null or empty");
-            throw new HubException("Connection ID is invalid");
+            throw new HubException("连接ID无效");
         }
         
         using var state = await InitProcessingStateAsync(connectionId);
@@ -100,35 +107,60 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             
             using var _ = new ActivityScope(nameof(PublishEventAsync));
 
-            // 减少嵌套，优化异常处理流程
-            var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
+            // 提前启动事件反序列化以提高并行性能
+            var eventDeserializeTask = Task.Run(() => DeserializeEvent(eventTypeName, eventJson));
+            
+            // 减少嵌套，优化异常处理流程，同时启动组成员初始化
+            var groupMembersTask = InitializeGroupMembers(grainId);
+            
+            // 等待两个任务并行完成
+            await Task.WhenAll(eventDeserializeTask, groupMembersTask);
+            
+            var (parentGAgent, signalRGAgent) = groupMembersTask.Result;
+            var eventInstance = eventDeserializeTask.Result;
+            
             if (parentGAgent is null || signalRGAgent is null)
             {
                 _logger.LogWarning("PublishEventAsync: Failed to initialize group members for GrainId {GrainId}", grainId);
                 return null;
             }
+            
+            if (eventInstance == null)
+            {
+                _logger.LogWarning("PublishEventAsync: Failed to deserialize event of type {EventType}", eventTypeName);
+                throw new HubException($"无法反序列化类型为 {eventTypeName} 的事件");
+            }
 
-            await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
-            await parentGAgent.RegisterAsync(signalRGAgent);
+            // 并行执行连接注册和代理注册
+            var addConnectionTask = AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
+            var registerTask = parentGAgent.RegisterAsync(signalRGAgent);
+            
+            await Task.WhenAll(addConnectionTask, registerTask);
             
             _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId}",
                 signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
             
-            var eventInstance = DeserializeEvent(eventTypeName, eventJson);
-            if (eventInstance == null)
-            {
-                _logger.LogWarning("PublishEventAsync: Failed to deserialize event of type {EventType}", eventTypeName);
-                throw new HubException($"Failed to deserialize event of type {eventTypeName}");
-            }
-            
-            await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
+            // 使用带取消令牌的任务，防止长时间挂起
+            await signalRGAgent.PublishEventAsync(eventInstance, connectionId)
+                .WaitAsync(TimeSpan.FromSeconds(30), state.Cts.Token);
+                
             return signalRGAgent.GetGrainId();
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("PublishEventAsync: Operation canceled for connection {ConnectionId}", connectionId);
+            throw new HubException("操作已取消");
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("PublishEventAsync: Operation timed out for connection {ConnectionId}", connectionId);
+            throw new HubException("操作超时");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "PublishEventAsync: Error processing event for connection {ConnectionId}, GrainId {GrainId}",
                 connectionId, grainId);
-            throw new HubException("Failed to process event: " + ex.Message);
+            throw new HubException("处理事件失败: " + ex.Message);
         }
         finally
         {
@@ -142,7 +174,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         if (string.IsNullOrEmpty(connectionId))
         {
             _logger.LogWarning("SubscribeAsync: Connection ID is null or empty");
-            throw new HubException("Connection ID is invalid");
+            throw new HubException("连接ID无效");
         }
         
         using var state = await InitProcessingStateAsync(connectionId);
@@ -154,35 +186,60 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
             using var _ = new ActivityScope(nameof(SubscribeAsync));
 
-            // 减少嵌套，优化异常处理流程
-            var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
+            // 提前启动事件反序列化以提高并行性能
+            var eventDeserializeTask = Task.Run(() => DeserializeEvent(eventTypeName, eventJson));
+            
+            // 减少嵌套，优化异常处理流程，同时启动组成员初始化
+            var groupMembersTask = InitializeGroupMembers(grainId);
+            
+            // 等待两个任务并行完成
+            await Task.WhenAll(eventDeserializeTask, groupMembersTask);
+            
+            var (parentGAgent, signalRGAgent) = groupMembersTask.Result;
+            var eventInstance = eventDeserializeTask.Result;
+            
             if (parentGAgent is null || signalRGAgent is null)
             {
                 _logger.LogWarning("SubscribeAsync: Failed to initialize group members for GrainId {GrainId}", grainId);
                 return null;
             }
+            
+            if (eventInstance == null)
+            {
+                _logger.LogWarning("SubscribeAsync: Failed to deserialize event of type {EventType}", eventTypeName);
+                throw new HubException($"无法反序列化类型为 {eventTypeName} 的事件");
+            }
 
-            await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
-            await parentGAgent.RegisterAsync(signalRGAgent);
+            // 并行执行连接注册和代理注册
+            var addConnectionTask = AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
+            var registerTask = parentGAgent.RegisterAsync(signalRGAgent);
+            
+            await Task.WhenAll(addConnectionTask, registerTask);
             
             _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId} for subscription",
                 signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
             
-            var eventInstance = DeserializeEvent(eventTypeName, eventJson);
-            if (eventInstance == null)
-            {
-                _logger.LogWarning("SubscribeAsync: Failed to deserialize event of type {EventType}", eventTypeName);
-                throw new HubException($"Failed to deserialize event of type {eventTypeName}");
-            }
-            
-            await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
+            // 使用带取消令牌的任务，防止长时间挂起
+            await signalRGAgent.PublishEventAsync(eventInstance, connectionId)
+                .WaitAsync(TimeSpan.FromSeconds(30), state.Cts.Token);
+                
             return signalRGAgent.GetGrainId();
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("SubscribeAsync: Operation canceled for connection {ConnectionId}", connectionId);
+            throw new HubException("操作已取消");
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("SubscribeAsync: Operation timed out for connection {ConnectionId}", connectionId);
+            throw new HubException("操作超时");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "SubscribeAsync: Error processing subscription for connection {ConnectionId}, GrainId {GrainId}",
                 connectionId, grainId);
-            throw new HubException("Failed to process subscription: " + ex.Message);
+            throw new HubException("处理订阅失败: " + ex.Message);
         }
         finally
         {
@@ -221,9 +278,12 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             // 获取父GAgent
             var parentGAgentTask = _gAgentFactory.GetGAgentAsync(parentGrainId);
             
-            // 并行获取父GAgent和SignalRGAgent
-            var parentGAgent = await parentGAgentTask;
-            var signalRGAgent = await GetOrCreateSignalRGAgentAsync(parentGAgent);
+            // 提前获取父代理完成后立即开始获取SignalRGAgent
+            var parentGAgent = await parentGAgentTask.ConfigureAwait(false);
+            var signalRGAgentTask = GetOrCreateSignalRGAgentAsync(parentGAgent);
+            
+            // 允许ConfigureAwait(false)，提高线程复用效率
+            var signalRGAgent = await signalRGAgentTask.ConfigureAwait(false);
             
             return (parentGAgent, signalRGAgent);
         }
@@ -238,18 +298,20 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     {
         try
         {
-            var siblings = await parentGAgent.GetChildrenAsync();
-            var existingGAgentId = siblings.FirstOrDefault(id =>
-                id.Type == GrainTypeCache.Get(typeof(SignalRGAgent)));
+            var siblings = await parentGAgent.GetChildrenAsync().ConfigureAwait(false);
+            var signalRGrainType = GrainTypeCache.Get(typeof(SignalRGAgent));
+            
+            var existingGAgentId = siblings.FirstOrDefault(id => id.Type == signalRGrainType);
 
             if (existingGAgentId.IsDefault is false)
             {
                 _logger.LogDebug("Using existing SignalRGAgent with ID {GAgentId}", existingGAgentId);
-                return await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(existingGAgentId.GetGuidKey());
+                return await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(existingGAgentId.GetGuidKey())
+                    .ConfigureAwait(false);
             }
             
             _logger.LogDebug("Creating new SignalRGAgent for parent {ParentGAgentId}", parentGAgent.GetGrainId());
-            return await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>();
+            return await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -259,13 +321,22 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         }
     }
 
-    private string GetConnectionId() => Context?.ConnectionId ?? string.Empty;
+    private string GetConnectionId() 
+    {
+        var connectionId = Context?.ConnectionId ?? string.Empty;
+        if (!string.IsNullOrEmpty(connectionId))
+        {
+            // 记录活跃连接
+            _activeConnections.TryAdd(connectionId, 1);
+        }
+        return connectionId;
+    }
 
     private static async Task AddConnectionIdIfNeeded(ISignalRGAgent agent, string connectionId, bool fireAndForget)
     {
         if (!string.IsNullOrEmpty(connectionId))
         {
-            await agent.AddConnectionIdAsync(connectionId, fireAndForget);
+            await agent.AddConnectionIdAsync(connectionId, fireAndForget).ConfigureAwait(false);
         }
     }
 
@@ -273,7 +344,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     {
         if (!string.IsNullOrEmpty(connectionId))
         {
-            await agent.RemoveConnectionIdAsync(connectionId);
+            await agent.RemoveConnectionIdAsync(connectionId).ConfigureAwait(false);
         }
     }
 
@@ -291,8 +362,17 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             _logger.LogInformation("UnsubscribeAsync: Connection {ConnectionId}, SignalRGAgentGrainId {GrainId}",
                 connectionId, signalRGAgentGrainId);
                 
-            var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentGrainId.GetGuidKey());
-            await signalRGAgent.RemoveConnectionIdAsync(connectionId);
+            var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentGrainId.GetGuidKey())
+                .ConfigureAwait(false);
+                
+            // 设置超时，防止长时间阻塞
+            await signalRGAgent.RemoveConnectionIdAsync(connectionId)
+                .WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("UnsubscribeAsync: Operation timed out for connection {ConnectionId}", connectionId);
         }
         catch (Exception ex)
         {
@@ -308,8 +388,11 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         
         try
         {
-            await base.OnConnectedAsync();
-            await Groups.AddToGroupAsync(connectionId, Guid.Empty.ToString());
+            var baseTask = base.OnConnectedAsync();
+            var groupTask = Groups.AddToGroupAsync(connectionId, Guid.Empty.ToString());
+            
+            // 并行执行连接初始化任务
+            await Task.WhenAll(baseTask, groupTask);
         }
         catch (Exception ex)
         {
@@ -326,8 +409,14 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             
         try
         {
-            await base.OnDisconnectedAsync(exception);
-            await Groups.RemoveFromGroupAsync(connectionId, Guid.Empty.ToString());
+            // 清理活跃连接列表
+            _activeConnections.TryRemove(connectionId, out _);
+            
+            var baseTask = base.OnDisconnectedAsync(exception);
+            var groupTask = Groups.RemoveFromGroupAsync(connectionId, Guid.Empty.ToString());
+            
+            // 并行执行连接终止任务
+            await Task.WhenAll(baseTask, groupTask);
         }
         catch (Exception ex)
         {
@@ -342,4 +431,36 @@ internal static class GrainTypeCache
 
     public static GrainType Get(Type grainType) =>
         _cache.GetOrAdd(grainType, t => GrainType.Create(t.FullName!));
+}
+
+// 为Task添加超时扩展方法
+internal static class TaskExtensions
+{
+    public static async Task WaitAsync(this Task task, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var timeoutTask = Task.Delay(timeout, cancellationToken);
+        var completedTask = await Task.WhenAny(task, timeoutTask);
+        
+        if (completedTask == timeoutTask)
+        {
+            throw new TimeoutException("任务执行超时");
+        }
+        
+        // 确保原始任务的异常会被正确传播
+        await task;
+    }
+    
+    public static async Task<T> WaitAsync<T>(this Task<T> task, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var timeoutTask = Task.Delay(timeout, cancellationToken);
+        var completedTask = await Task.WhenAny(task, timeoutTask);
+        
+        if (completedTask == timeoutTask)
+        {
+            throw new TimeoutException("任务执行超时");
+        }
+        
+        // 确保原始任务的异常会被正确传播
+        return await task;
+    }
 }
