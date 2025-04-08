@@ -10,4 +10,5 @@ alwaysApply: true
 - 请基于C#与Orleans的最佳实践
 - 请尽量不引入新依赖
 - 请保持系统复杂度够低
-
+- 捕获Exception一定要慎重
+- 捕获未知异常要记录日志
