@@ -59,14 +59,52 @@ internal sealed class ClientGrain : IGrainBase, IClientGrain
 
     public async Task OnConnect(Guid serverId)
     {
-        var serverDisconnectedStream = _streamProvider.GetServerDisconnectionStream(serverId);
-        _serverDisconnectedSubscription = await serverDisconnectedStream.SubscribeAsync(_ => OnDisconnect("server-disconnected"));
+        try 
+        {
+            // Unsubscribe from any existing subscription to prevent memory leaks
+            if (_serverDisconnectedSubscription is not null)
+            {
+                _logger.LogDebug("Unsubscribing from previous server disconnection stream for {hubName}, connection {connectionId}, previous server {previousServerId}",
+                    _hubName, _connectionId, _clientState.State.ServerId);
+                    
+                try
+                {
+                    await _serverDisconnectedSubscription.UnsubscribeAsync();
+                    _logger.LogTrace("Successfully unsubscribed from previous server disconnection stream");
+                }
+                catch (Exception unsubEx)
+                {
+                    _logger.LogWarning(unsubEx, "Failed to unsubscribe from previous server disconnection stream for {hubName}, connection {connectionId}",
+                        _hubName, _connectionId);
+                    // Continue despite unsubscribe failure
+                }
+                
+                _serverDisconnectedSubscription = null;
+            }
 
-        _clientState.State.ServerId = serverId;
-        await _clientState.WriteStateAsync();
-        
-        _logger.LogDebug("Connected connection on {hubName} for connection {connectionId} to server {serverId}.",
-            _hubName, _connectionId, _clientState.State.ServerId);
+            // Get the stream and subscribe in one optimized flow
+            _logger.LogDebug("Subscribing to server disconnection stream for {hubName}, connection {connectionId}, server {serverId}",
+                _hubName, _connectionId, serverId);
+                
+            _serverDisconnectedSubscription = await _streamProvider
+                .GetServerDisconnectionStream(serverId)
+                .SubscribeAsync(_ => OnDisconnect("server-disconnected"));
+                    
+            _logger.LogDebug("Successfully subscribed to server disconnection stream for server {serverId}", serverId);
+
+            // Update state after successful subscription
+            _clientState.State.ServerId = serverId;
+            await _clientState.WriteStateAsync();
+            
+            _logger.LogDebug("Connected connection on {hubName} for connection {connectionId} to server {serverId}.",
+                _hubName, _connectionId, serverId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to establish connection on {hubName} for connection {connectionId} to server {serverId}",
+                _hubName, _connectionId, serverId);
+            throw;
+        }
     }
 
     public async Task OnDisconnect(string? reason = null)
