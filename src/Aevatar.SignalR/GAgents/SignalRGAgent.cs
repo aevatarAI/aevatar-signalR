@@ -35,9 +35,7 @@ public class SignalRGAgent :
     private readonly TimeSpan _processQueueInterval = TimeSpan.FromMilliseconds(200);
     private const int MaxMessagesPerBatch = 50;
     private const int MaxRetries = 3;
-    private volatile bool _isProcessingQueue;
     private readonly Channel<ResponseToPublisherEventBase> _messageChannel;
-    private readonly SemaphoreSlim _processingLock = new(1, 1);
 
     public SignalRGAgent(IGrainFactory grainFactory)
     {
@@ -49,7 +47,8 @@ public class SignalRGAgent :
             AllowSynchronousContinuations = false
         });
         
-        _ = ProcessMessagesAsync();
+        // 为了避免启动后台任务（Orleans不推荐），采用Timer触发方式，确保Grain单线程模型
+        // _ = ProcessMessagesAsync();
     }
 
     public override Task<string> GetDescriptionAsync()
@@ -82,39 +81,36 @@ public class SignalRGAgent :
 
     private async Task ProcessQueueTimerCallback(object state)
     {
-        if (!await _processingLock.WaitAsync(0))
-            return;
+        // 移除锁，Orleans已经保证了Grain的单线程执行
+        // if (!await _processingLock.WaitAsync(0))
+        //    return;
             
         try
         {
-            if (State.PendingMessages.Count > 0 && !_isProcessingQueue)
+            // 先处理Channel中的消息
+            await ProcessChannelMessagesAsync();
+            
+            // 然后处理持久化状态中的消息
+            if (State.PendingMessages.Count > 0)
             {
-                _isProcessingQueue = true;
-                try
+                var messagesToProcess = State.PendingMessages
+                    .Take(MaxMessagesPerBatch)
+                    .ToList();
+                    
+                Logger.LogDebug("Processing {Count} pending messages from state queue", messagesToProcess.Count);
+                
+                foreach (var message in messagesToProcess)
                 {
-                    var messagesToProcess = State.PendingMessages
-                        .Take(MaxMessagesPerBatch)
-                        .ToList();
-                        
-                    Logger.LogDebug("Processing {Count} pending messages from state queue", messagesToProcess.Count);
-                    
-                    foreach (var message in messagesToProcess)
-                    {
-                        _messageChannel.Writer.TryWrite(message);
-                    }
-                    
-                    if (messagesToProcess.Count > 0)
-                    {
-                        RaiseEvent(new RemovePendingMessagesStateLogEvent
-                        {
-                            Count = messagesToProcess.Count
-                        });
-                        await ConfirmEvents();
-                    }
+                    _messageChannel.Writer.TryWrite(message);
                 }
-                finally
+                
+                if (messagesToProcess.Count > 0)
                 {
-                    _isProcessingQueue = false;
+                    RaiseEvent(new RemovePendingMessagesStateLogEvent
+                    {
+                        Count = messagesToProcess.Count
+                    });
+                    await ConfirmEvents();
                 }
             }
         }
@@ -122,44 +118,26 @@ public class SignalRGAgent :
         {
             Logger.LogError(ex, "Error in ProcessQueueTimerCallback");
         }
-        finally
-        {
-            _processingLock.Release();
-        }
+        // 移除finally块中的锁释放
     }
 
-    private async Task ProcessMessagesAsync()
+    private async Task ProcessChannelMessagesAsync()
     {
-        var backoffDelay = TimeSpan.FromMilliseconds(100);
-        var maxBackoffDelay = TimeSpan.FromSeconds(5);
+        // 确保每次处理的消息数量有限，避免长时间阻塞Grain
+        int processedCount = 0;
         
-        while (true)
+        while (processedCount < MaxMessagesPerBatch && _messageChannel.Reader.TryRead(out var message))
         {
             try
             {
-                await foreach (var message in _messageChannel.Reader.ReadAllAsync())
-                {
-                    try
-                    {
-                        await SendWithRetryAsync(message);
-                        backoffDelay = TimeSpan.FromMilliseconds(100);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogError(ex, "Error processing message: {Message}", message);
-                        RaiseEvent(new EnqueueMessageStateLogEvent { Message = message });
-                        await ConfirmEvents();
-                    }
-                }
+                await SendWithRetryAsync(message);
+                processedCount++;
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Fatal error in message processing loop");
-                
-                await Task.Delay(backoffDelay);
-                backoffDelay = TimeSpan.FromMilliseconds(Math.Min(backoffDelay.TotalMilliseconds * 2, maxBackoffDelay.TotalMilliseconds));
-                
-                continue;
+                Logger.LogError(ex, "Error processing message: {Message}", message);
+                RaiseEvent(new EnqueueMessageStateLogEvent { Message = message });
+                await ConfirmEvents();
             }
         }
     }
@@ -250,12 +228,10 @@ public class SignalRGAgent :
 
     private Task EnqueueMessageAsync(ResponseToPublisherEventBase message)
     {
+        // 确保消息入队列，如果无法立即发送则将其保存到状态中
         if (!_messageChannel.Writer.TryWrite(message))
         {
-            RaiseEvent(new EnqueueMessageStateLogEvent
-            {
-                Message = message
-            });
+            RaiseEvent(new EnqueueMessageStateLogEvent { Message = message });
             return ConfirmEvents();
         }
         
@@ -390,7 +366,10 @@ public class SignalRGAgent :
     public override Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken)
     {
         _processQueueTimer?.Dispose();
-        return Task.CompletedTask;
+        // 确保关闭消息通道
+        _messageChannel.Writer.Complete();
+        
+        return base.OnDeactivateAsync(reason, cancellationToken);
     }
 
     [GenerateSerializer]

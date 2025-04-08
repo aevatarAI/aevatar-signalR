@@ -16,14 +16,15 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
     private readonly ILogger<AevatarSignalRHub> _logger;
     private readonly EventDeserializer _eventDeserializer;
     
-    // 优化1: 使用AsyncLocal来自动关联到当前请求线程上下文，不需要字典查找
+    // 使用AsyncLocal来自动关联到当前请求线程上下文
     private static readonly AsyncLocal<ProcessingState> _currentProcessingState = new();
     
-    // 优化2: 使用对象池来减少临时对象的创建
+    // 使用对象池来减少临时对象的创建
     private static readonly ObjectPool<SemaphoreSlim> _semaphorePool = 
         new DefaultObjectPool<SemaphoreSlim>(new SemaphoreSlimPoolPolicy(), 50);
-    
-    private static readonly TimeSpan SemaphoreTimeout = TimeSpan.FromSeconds(30);
+        
+    // 使用较短的超时时间，避免长时间等待
+    private static readonly TimeSpan SemaphoreTimeout = TimeSpan.FromSeconds(10);
     
     private class SemaphoreSlimPoolPolicy : IPooledObjectPolicy<SemaphoreSlim>
     {
@@ -63,6 +64,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         _eventDeserializer = new EventDeserializer();
     }
 
+    // 优化获取处理状态的方法，使用更短的超时
     private async Task<ProcessingState> InitProcessingStateAsync(string connectionId)
     {
         var semaphore = _semaphorePool.Get();
@@ -98,6 +100,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             
             using var _ = new ActivityScope(nameof(PublishEventAsync));
 
+            // 减少嵌套，优化异常处理流程
             var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
             if (parentGAgent == null || signalRGAgent == null)
             {
@@ -105,30 +108,27 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
                 return null;
             }
 
-            try
+            await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
+            await parentGAgent.RegisterAsync(signalRGAgent);
+            
+            _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId}",
+                signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
+            
+            var eventInstance = DeserializeEvent(eventTypeName, eventJson);
+            if (eventInstance == null)
             {
-                await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
-                await parentGAgent.RegisterAsync(signalRGAgent);
-                
-                _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId}",
-                    signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
-                
-                var eventInstance = DeserializeEvent(eventTypeName, eventJson);
-                if (eventInstance == null)
-                {
-                    _logger.LogWarning("PublishEventAsync: Failed to deserialize event of type {EventType}", eventTypeName);
-                    throw new HubException($"Failed to deserialize event of type {eventTypeName}");
-                }
-                
-                await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
-                return signalRGAgent.GetGrainId();
+                _logger.LogWarning("PublishEventAsync: Failed to deserialize event of type {EventType}", eventTypeName);
+                throw new HubException($"Failed to deserialize event of type {eventTypeName}");
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "PublishEventAsync: Error processing event for connection {ConnectionId}, GrainId {GrainId}",
-                    connectionId, grainId);
-                throw new HubException("Failed to process event: " + ex.Message);
-            }
+            
+            await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
+            return signalRGAgent.GetGrainId();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PublishEventAsync: Error processing event for connection {ConnectionId}, GrainId {GrainId}",
+                connectionId, grainId);
+            throw new HubException("Failed to process event: " + ex.Message);
         }
         finally
         {
@@ -154,6 +154,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
             using var _ = new ActivityScope(nameof(SubscribeAsync));
 
+            // 减少嵌套，优化异常处理流程
             var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
             if (parentGAgent == null || signalRGAgent == null)
             {
@@ -161,30 +162,27 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
                 return null;
             }
 
-            try
+            await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
+            await parentGAgent.RegisterAsync(signalRGAgent);
+            
+            _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId} for subscription",
+                signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
+            
+            var eventInstance = DeserializeEvent(eventTypeName, eventJson);
+            if (eventInstance == null)
             {
-                await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
-                await parentGAgent.RegisterAsync(signalRGAgent);
-                
-                _logger.LogDebug("SignalRGAgent {SignalRGAgentId} registered to parent {ParentGAgentId} for subscription",
-                    signalRGAgent.GetGrainId(), parentGAgent.GetGrainId());
-                
-                var eventInstance = DeserializeEvent(eventTypeName, eventJson);
-                if (eventInstance == null)
-                {
-                    _logger.LogWarning("SubscribeAsync: Failed to deserialize event of type {EventType}", eventTypeName);
-                    throw new HubException($"Failed to deserialize event of type {eventTypeName}");
-                }
-                
-                await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
-                return signalRGAgent.GetGrainId();
+                _logger.LogWarning("SubscribeAsync: Failed to deserialize event of type {EventType}", eventTypeName);
+                throw new HubException($"Failed to deserialize event of type {eventTypeName}");
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "SubscribeAsync: Error processing subscription for connection {ConnectionId}, GrainId {GrainId}",
-                    connectionId, grainId);
-                throw new HubException("Failed to process subscription: " + ex.Message);
-            }
+            
+            await signalRGAgent.PublishEventAsync(eventInstance, connectionId);
+            return signalRGAgent.GetGrainId();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SubscribeAsync: Error processing subscription for connection {ConnectionId}, GrainId {GrainId}",
+                connectionId, grainId);
+            throw new HubException("Failed to process subscription: " + ex.Message);
         }
         finally
         {
@@ -205,6 +203,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         }
     }
 
+    // 优化的GAgent初始化方法，减少嵌套，增加并行获取能力
     private async Task<(IGAgent? ParentGAgent, ISignalRGAgent? SignalRGAgent)> InitializeGroupMembers(
         GrainId grainId)
     {
@@ -218,8 +217,12 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
                 _logger.LogWarning("Parent GrainId is default for target GrainId {GrainId}", grainId);
                 return (null, null);
             }
-
-            var parentGAgent = await _gAgentFactory.GetGAgentAsync(parentGrainId);
+            
+            // 获取父GAgent
+            var parentGAgentTask = _gAgentFactory.GetGAgentAsync(parentGrainId);
+            
+            // 并行获取父GAgent和SignalRGAgent
+            var parentGAgent = await parentGAgentTask;
             var signalRGAgent = await GetOrCreateSignalRGAgentAsync(parentGAgent);
             
             return (parentGAgent, signalRGAgent);

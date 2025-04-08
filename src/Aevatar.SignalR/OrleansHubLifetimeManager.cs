@@ -18,10 +18,11 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
     private readonly string _hubName;
     private readonly IClusterClient _clusterClient;
     private readonly SemaphoreSlim _streamSetupLock = new(1);
-    private readonly ConcurrentDictionary<string, HubConnectionContext> _connections = new();
-    private readonly ConcurrentDictionary<string, byte> _activeTransfers = new();
+    private readonly ConcurrentDictionary<string, HubConnectionContext> _connections = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _activeTransfers = new(StringComparer.Ordinal);
     private readonly int _maxParallelTransfers;
-    private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly SemaphoreSlim[] _connectionLocks;
+    private readonly int _lockCount = 32; // 使用32个锁划分，减少锁冲突
     private readonly TimeSpan _connectionTimeout = TimeSpan.FromSeconds(10);
 
     private IStreamProvider? _streamProvider;
@@ -42,6 +43,13 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         _logger = logger;
         _clusterClient = clusterClient;
         _maxParallelTransfers = Environment.ProcessorCount * 2; // 基于处理器数量设置并行传输上限
+        
+        // 初始化锁数组
+        _connectionLocks = new SemaphoreSlim[_lockCount];
+        for (int i = 0; i < _lockCount; i++)
+        {
+            _connectionLocks[i] = new SemaphoreSlim(1, 1);
+        }
 
         _logger.LogDebug("Created Orleans HubLifetimeManager {hubName})", _hubName);
     }
@@ -125,7 +133,7 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
             return Task.CompletedTask;
         
         var payload = allMessage.Message;
-        var tasks = new List<Task>();
+        var tasks = new List<Task>(Math.Min(100, _connections.Count)); // 预分配合理的大小
         
         // 创建连接的快照以避免枚举时修改集合
         var connections = _connections.Values.ToArray();
@@ -162,12 +170,16 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
     private async Task<bool> TryAcquireTransferSlot(string connectionId, TimeSpan timeout)
     {
+        // 获取对应的锁索引
+        var lockIndex = Math.Abs(connectionId.GetHashCode() % _lockCount);
+        var lockObj = _connectionLocks[lockIndex];
+        
         // 如果已存在，则已获取槽位
         if (_activeTransfers.TryGetValue(connectionId, out _))
             return true;
             
         // 尝试获取连接锁
-        if (!await _connectionLock.WaitAsync(timeout))
+        if (!await lockObj.WaitAsync(timeout))
             return false;
             
         try
@@ -185,7 +197,7 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         }
         finally
         {
-            _connectionLock.Release();
+            lockObj.Release();
         }
     }
     
@@ -205,30 +217,30 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         
         try
         {
-            // 如果无法获取传输槽位，则延迟处理
+            // 如果无法获取传输槽位，则延迟处理并重试
             if (!(await TryAcquireTransferSlot(connectionId, _connectionTimeout)))
             {
                 _logger.LogWarning("Connection processing delayed due to high load: {connectionId}", connectionId);
                 
-                // 重试一次
-                await Task.Delay(100);
-                if (!(await TryAcquireTransferSlot(connectionId, _connectionTimeout)))
+                // 使用指数退避重试
+                TimeSpan delay = TimeSpan.FromMilliseconds(100);
+                for (int i = 0; i < 3; i++) // 最多重试3次
+                {
+                    await Task.Delay(delay);
+                    if (await TryAcquireTransferSlot(connectionId, _connectionTimeout))
+                        break;
+                        
+                    delay = TimeSpan.FromMilliseconds(Math.Min(delay.TotalMilliseconds * 2, 1000)); // 最长等待1秒
+                }
+                
+                if (!_activeTransfers.ContainsKey(connectionId))
                 {
                     throw new HubException("Server is currently handling too many connections. Please try again later.");
                 }
             }
             
             // 添加到本地连接字典
-            if (!_connections.TryAdd(connectionId, connection))
-            {
-                _logger.LogWarning("Connection {connectionId} already exists in dictionary", connectionId);
-                var existingConnection = _connections[connectionId];
-                // 如果连接已中止，则用新连接替换
-                if (existingConnection.ConnectionAborted.IsCancellationRequested)
-                {
-                    _connections[connectionId] = connection;
-                }
-            }
+            _connections[connectionId] = connection; // 简化添加逻辑，减少判断
 
             // 告知 Orleans Grain 系统新连接已建立
             var client = _clusterClient.GetClientGrain(_hubName, connectionId);
@@ -250,25 +262,9 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 "Error while processing connection {connectionId} on hub {hubName} (serverId: {serverId})",
                 connectionId, _hubName, _serverId);
                 
-            // 确保连接从字典中移除
-            _connections.TryRemove(connectionId, out _);
-            
-            // 如果发生错误，尝试通知客户端并关闭连接
-            try
-            {
-                await connection.WriteAsync(new CloseMessage("Connection failed due to server error"));
-            }
-            catch (Exception writeEx)
-            {
-                _logger.LogError(writeEx, "Failed to write error message to connection {connectionId}", connectionId);
-            }
-            
-            throw;
-        }
-        finally
-        {
-            // 释放传输槽位
+            // 确保在任何情况下释放资源
             ReleaseTransferSlot(connectionId);
+            throw;
         }
     }
 
@@ -424,49 +420,37 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
     public void Dispose()
     {
-        _logger.LogDebug("Disposing Orleans HubLifetimeManager {hubName} (serverId: {serverId})",
-            _hubName, _serverId);
-
-        _timer?.Dispose();
-
-        var toUnsubscribe = new List<Task>();
-        if (_serverStream is not null)
-        {
-            toUnsubscribe.Add(Task.Factory.StartNew(async () =>
-            {
-                var subscriptions = await _serverStream.GetAllSubscriptionHandles();
-                var subs = new List<Task>();
-                subs.AddRange(subscriptions.Select(s => s.UnsubscribeAsync()));
-                await Task.WhenAll(subs);
-            }));
-        }
-
-        if (_allStream is not null)
-        {
-            toUnsubscribe.Add(Task.Factory.StartNew(async () =>
-            {
-                var subscriptions = await _allStream.GetAllSubscriptionHandles();
-                var subs = new List<Task>();
-                subs.AddRange(subscriptions.Select(s => s.UnsubscribeAsync()));
-                await Task.WhenAll(subs);
-            }));
-        }
-
-        var serverDirectoryGrain = _clusterClient.GetServerDirectoryGrain();
-        toUnsubscribe.Add(serverDirectoryGrain.Unregister(_serverId));
-        
-        // 等待所有取消订阅任务完成
         try
         {
-            Task.WhenAll(toUnsubscribe.ToArray()).GetAwaiter().GetResult();
+            _timer?.Dispose();
+            
+            // 释放所有锁资源
+            if (_connectionLocks != null)
+            {
+                foreach (var lockObj in _connectionLocks)
+                {
+                    lockObj?.Dispose();
+                }
+            }
+            
+            // 通知服务器目录此服务器不再活跃
+            if (_serverId != Guid.Empty && _clusterClient is { } client)
+            {
+                try
+                {
+                    // 使用FireAndForgetExtension确保不阻塞
+                    client.GetServerDirectoryGrain().RemoveServer(_serverId).FireAndForget();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error removing server from directory during disposal");
+                }
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error unsubscribing from streams during disposal");
+            _logger.LogError(ex, "Error during HubLifetimeManager disposal");
         }
-        
-        // 释放锁资源
-        _streamSetupLock.Dispose();
     }
 
     public void Participate(ISiloLifecycle lifecycle)
