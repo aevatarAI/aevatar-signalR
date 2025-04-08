@@ -1,9 +1,11 @@
 using Aevatar.Core.Abstractions;
 using Aevatar.SignalR.GAgents;
 using Aevatar.SignalR.Tests.GAgents;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Shouldly;
+using NSubstitute;
 
 namespace Aevatar.SignalR.Tests;
 
@@ -42,6 +44,13 @@ public sealed class SignalRGAgentTests : AevatarSignalRTestBase
         {
             Greeting = "Hello, SignalR!"
         };
+
+        // 创建测试Hub上下文
+        var connection = SignalRTestHelper.CreateHubConnectionContext();
+        var mockContext = new TestHubCallerContext(connection);
+            
+        // 设置Hub的Context
+        typeof(Hub).GetProperty("Context")!.SetValue(_signalRHub, mockContext);
 
         await _signalRHub.PublishEventAsync(naiveGAgent.GetGrainId(), typeof(NaiveTestEvent).FullName!,
             JsonConvert.SerializeObject(naiveTestEvent));

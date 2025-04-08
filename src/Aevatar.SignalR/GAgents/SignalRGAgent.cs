@@ -13,7 +13,7 @@ public class SignalRGAgentState : StateBase
 {
     [Id(1)] public Dictionary<string, bool> ConnectionIds { get; set; } = new();
     [Id(2)] public Dictionary<Guid, string> ConnectionIdMap { get; set; } = new();
-    [Id(3)] public Queue<ResponseToPublisherEventBase> MessageQueue { get; set; } = new();
+    [Id(3)] public List<ResponseToPublisherEventBase> PendingMessages { get; set; } = new();
 }
 
 [GenerateSerializer]
@@ -32,13 +32,21 @@ public class SignalRGAgent :
 {
     private readonly HubContext<AevatarSignalRHub> _hubContext;
     private IDisposable? _processQueueTimer;
-    private readonly TimeSpan _processQueueInterval = TimeSpan.FromSeconds(1);
-    private const int MaxMessagesPerBatch = 20;
+    private readonly TimeSpan _processQueueInterval = TimeSpan.FromMilliseconds(200);
+    private const int MaxMessagesPerBatch = 50;
     private bool _isProcessingQueue;
+    private readonly Channel<ResponseToPublisherEventBase> _messageChannel;
 
     public SignalRGAgent(IGrainFactory grainFactory)
     {
         _hubContext = new HubContext<AevatarSignalRHub>(grainFactory);
+        _messageChannel = Channel.CreateUnbounded<ResponseToPublisherEventBase>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
+        
+        _ = ProcessMessagesAsync();
     }
 
     public override Task<string> GetDescriptionAsync()
@@ -48,6 +56,13 @@ public class SignalRGAgent :
 
     protected override Task OnGAgentActivateAsync(CancellationToken cancellationToken)
     {
+        foreach (var message in State.PendingMessages.ToList())
+        {
+            _messageChannel.Writer.TryWrite(message);
+        }
+        
+        RaiseEvent(new ClearPendingMessagesStateLogEvent());
+        
         _processQueueTimer = RegisterTimer(
             ProcessQueueTimerCallback,
             null,
@@ -59,53 +74,73 @@ public class SignalRGAgent :
 
     private async Task ProcessQueueTimerCallback(object state)
     {
-        await ProcessQueueAsync();
-    }
-
-    private async Task ProcessQueueAsync()
-    {
-        if (_isProcessingQueue) return;
-        
-        try
+        if (State.PendingMessages.Count > 0 && !_isProcessingQueue)
         {
             _isProcessingQueue = true;
-            
-            var messagesToProcess = new List<ResponseToPublisherEventBase>();
-            int count = 0;
-            
-            while (State.MessageQueue.Count > 0 && count < MaxMessagesPerBatch)
+            try
             {
-                messagesToProcess.Add(State.MessageQueue.Dequeue());
-                count++;
+                var messagesToProcess = State.PendingMessages.ToList();
+                foreach (var message in messagesToProcess)
+                {
+                    _messageChannel.Writer.TryWrite(message);
+                }
+                
+                RaiseEvent(new ClearPendingMessagesStateLogEvent());
+                await ConfirmEvents();
             }
-            
-            await ConfirmEvents();
-            
-            foreach (var message in messagesToProcess)
+            finally
             {
-                await SendWithRetryAsync(message);
+                _isProcessingQueue = false;
             }
         }
-        finally
+    }
+
+    private async Task ProcessMessagesAsync()
+    {
+        try
         {
-            _isProcessingQueue = false;
+            await foreach (var message in _messageChannel.Reader.ReadAllAsync())
+            {
+                try
+                {
+                    await SendWithRetryAsync(message);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Error processing message: {Message}", message);
+                    RaiseEvent(new EnqueueMessageStateLogEvent { Message = message });
+                    await ConfirmEvents();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Fatal error in message processing loop");
+            _ = Task.Delay(1000).ContinueWith(_ => ProcessMessagesAsync());
         }
     }
 
     private async Task SendWithRetryAsync(object message)
     {
         const int maxRetries = 3;
+        Exception? lastException = null;
+        
         for (var i = 0; i < maxRetries; i++)
         {
             try
             {
                 var connectionIdList = new Dictionary<string, bool>(State.ConnectionIds);
+                var sentCount = 0;
+                
                 foreach (var (connectionId, fireAndForget) in connectionIdList)
                 {
-                    Logger.LogInformation("Sending message to connectionId: {ConnectionId}, Message {Message}", connectionId,
-                        message);
+                    Logger.LogDebug("Sending message to connectionId: {ConnectionId}, Message type: {MessageType}", 
+                        connectionId, message.GetType().Name);
+                    
                     await _hubContext.Client(connectionId)
                         .Send(SignalROrleansConstants.ResponseMethodName, message);
+                    sentCount++;
+                    
                     if (fireAndForget)
                     {
                         Logger.LogDebug("Cleaning up connectionId: {ConnectionId}", connectionId);
@@ -113,29 +148,44 @@ public class SignalRGAgent :
                         {
                             ConnectionId = connectionId
                         });
-                        await ConfirmEvents();
                     }
                 }
-
+                
+                if (sentCount > 0)
+                {
+                    await ConfirmEvents();
+                }
                 return;
             }
             catch (Exception ex)
             {
-                if (i >= maxRetries - 1)
-                    Logger.LogError(ex, $"Message failed after {maxRetries} retries.");
-                else
-                    await Task.Delay(1000 * (i + 1));
+                lastException = ex;
+                if (i < maxRetries - 1)
+                {
+                    await Task.Delay(200 * (int)Math.Pow(2, i));
+                }
             }
+        }
+        
+        if (lastException != null)
+        {
+            Logger.LogError(lastException, "Message delivery failed after {MaxRetries} retries", maxRetries);
+            throw lastException;
         }
     }
 
     private Task EnqueueMessageAsync(ResponseToPublisherEventBase message)
     {
-        RaiseEvent(new EnqueueMessageStateLogEvent
+        if (!_messageChannel.Writer.TryWrite(message))
         {
-            Message = message
-        });
-        return ConfirmEvents();
+            RaiseEvent(new EnqueueMessageStateLogEvent
+            {
+                Message = message
+            });
+            return ConfirmEvents();
+        }
+        
+        return Task.CompletedTask;
     }
 
     public async Task PublishEventAsync<T>(T @event, string connectionId) where T : EventBase
@@ -248,12 +298,14 @@ public class SignalRGAgent :
             case RemoveConnectionIdStateLogEvent removeConnectionIdStateLogEvent:
                 State.ConnectionIds.Remove(removeConnectionIdStateLogEvent.ConnectionId);
                 break;
-            case MapCorrelationIdToConnectionIdStateLogEvent mapCorrelationIdToConnectionIdStateLogEvent:
-                State.ConnectionIdMap[mapCorrelationIdToConnectionIdStateLogEvent.CorrelationId] =
-                    mapCorrelationIdToConnectionIdStateLogEvent.ConnectionId;
+            case MapCorrelationIdToConnectionIdStateLogEvent mapEvent:
+                State.ConnectionIdMap[mapEvent.CorrelationId] = mapEvent.ConnectionId;
                 break;
-            case EnqueueMessageStateLogEvent enqueueMessageStateLogEvent:
-                State.MessageQueue.Enqueue(enqueueMessageStateLogEvent.Message);
+            case EnqueueMessageStateLogEvent enqueueEvent:
+                State.PendingMessages.Add(enqueueEvent.Message);
+                break;
+            case ClearPendingMessagesStateLogEvent:
+                State.PendingMessages.Clear();
                 break;
         }
     }
@@ -288,5 +340,10 @@ public class SignalRGAgent :
     public class EnqueueMessageStateLogEvent : SignalRStateLogEvent
     {
         [Id(0)] public ResponseToPublisherEventBase Message { get; set; }
+    }
+
+    [GenerateSerializer]
+    public class ClearPendingMessagesStateLogEvent : StateLogEventBase<SignalRStateLogEvent>
+    {
     }
 }
