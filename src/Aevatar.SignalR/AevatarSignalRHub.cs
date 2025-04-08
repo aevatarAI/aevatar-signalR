@@ -28,7 +28,18 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         var connectionId = GetConnectionId();
         _logger.LogInformation("Identifying user {UserId} with connection {ConnectionId}", userId, connectionId);
         
-        // Store the mapping
+        // Check if user had a previous connection
+        if (UserIdToConnectionId.TryGetValue(userId, out var oldConnectionId) && 
+            oldConnectionId != connectionId)
+        {
+            _logger.LogInformation("User {UserId} reconnected. Old connection: {OldConnectionId}, New connection: {NewConnectionId}", 
+                userId, oldConnectionId, connectionId);
+            
+            // Migrate any subscriptions or state from old connection to new connection
+            await MigrateUserConnectionAsync(userId, oldConnectionId, connectionId);
+        }
+        
+        // Update the mappings
         UserIdToConnectionId[userId] = connectionId;
         ConnectionIdToUserId[connectionId] = userId;
     }
@@ -184,6 +195,24 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         
         await base.OnDisconnectedAsync(exception);
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, Guid.Empty.ToString());
+    }
+
+    // Add a new method to migrate connection state
+    private async Task MigrateUserConnectionAsync(string userId, string oldConnectionId, string newConnectionId)
+    {
+        // Find SignalRGAgents associated with this user
+        // Update their connection information
+        // Re-establish subscriptions
+        
+        // Example (implement according to your specific requirements):
+        var grainId = GrainId.Parse(userId);
+        var (_, signalRGAgent) = await InitializeGroupMembers(grainId);
+        
+        if (signalRGAgent != null)
+        {
+            await RemoveConnectionIdIfNeeded(signalRGAgent, oldConnectionId);
+            await AddConnectionIdIfNeeded(signalRGAgent, newConnectionId, false);
+        }
     }
 }
 
