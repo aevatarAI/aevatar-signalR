@@ -150,7 +150,7 @@ public class SignalRTestClient : ITransferFormatFeature, IConnectionHeartbeatFea
 
             if (message == null)
             {
-                var result = await Connection.Application!.Input.ReadAsync().OrTimeout();
+                var result = await Connection.Application!.Input.ReadAsync().OrTimeout(30000);
                 var buffer = result.Buffer;
 
                 try
