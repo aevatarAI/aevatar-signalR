@@ -11,7 +11,7 @@ public class NaiveTestGAgentState : StateBase
 
 public class NaiveTestStateLogEvent : StateLogEventBase<NaiveTestStateLogEvent>
 {
-    [Id(0)] public Guid Id { get; set; }
+    [Id(0)] public new Guid Id { get; set; }
 }
 
 [GAgent("naiveTest")]

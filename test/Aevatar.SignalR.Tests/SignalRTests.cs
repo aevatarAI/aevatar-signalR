@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.SignalR.Protocol;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Shouldly;
+using NSubstitute;
 
 namespace Aevatar.SignalR.Tests;
 
@@ -43,7 +44,13 @@ public sealed class SignalRTests : AevatarSignalRTestBase
         var connection = SignalRTestHelper.CreateHubConnectionContext(client.Connection);
         await _hubLifetimeManager.OnConnectedAsync(connection);
 
+        // 创建测试Hub上下文
+        var mockContext = new TestHubCallerContext(connection);
         var hub = new AevatarSignalRHub(_gAgentFactory, _logger);
+        
+        // 设置Hub的Context
+        typeof(Hub).GetProperty("Context")!.SetValue(hub, mockContext);
+
         await hub.PublishEventAsync(signalRTestGAgent.GetGrainId(), typeof(NaiveTestEvent).FullName!,
             JsonConvert.SerializeObject(new NaiveTestEvent
             {

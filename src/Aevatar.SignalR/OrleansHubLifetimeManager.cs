@@ -18,6 +18,8 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
     private readonly IClusterClient _clusterClient;
     private readonly SemaphoreSlim _streamSetupLock = new(1);
     private readonly ConcurrentDictionary<string, HubConnectionContext> _connections = new();
+    private readonly ConcurrentDictionary<string, byte> _activeTransfers = new();
+    private readonly int _maxParallelTransfers;
 
     private IStreamProvider? _streamProvider;
     private IAsyncStream<ClientMessage> _serverStream = default!;
@@ -41,17 +43,27 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
         _logger = logger;
         _clusterClient = clusterClient;
+        _maxParallelTransfers = Environment.ProcessorCount * 2; // 基于处理器数量设置并行传输上限
 
         _logger.LogDebug("Created Orleans HubLifetimeManager - Instance: {InstanceId}, Hub: {HubName}",
             _instanceId, _hubName);
     }
 
-    private async Task HeartbeatCheck()
+    private Task HeartbeatCheck()
     {
-        _logger.LogInformation(
-            "Heartbeat check - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}",
-            _instanceId, _hubName, _serverId);
-        _clusterClient.GetServerDirectoryGrain().Heartbeat(_serverId);
+        try
+        {
+            _logger.LogInformation(
+                "Heartbeat check - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}",
+                _instanceId, _hubName, _serverId);
+            return _clusterClient.GetServerDirectoryGrain().Heartbeat(_serverId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during heartbeat check for hub {hubName} (serverId: {serverId})",
+                _hubName, _serverId);
+            return Task.CompletedTask;
+        }
     }
 
     private async Task EnsureStreamSetup()
@@ -64,14 +76,14 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
             return;
         }
 
-        _serverId = _serverId == Guid.Empty ? Guid.NewGuid() : _serverId;
-
         try
         {
             await _streamSetupLock.WaitAsync();
 
             if (_streamProvider is not null)
                 return;
+
+            _serverId = _serverId == Guid.Empty ? Guid.NewGuid() : _serverId;
 
             _logger.LogInformation(
                 "Initializing Orleans HubLifetimeManager - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}",
@@ -82,7 +94,8 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
             _allStream = _streamProvider.GetAllStream(_hubName);
 
             _timer = new Timer(
-                _ => Task.Run(HeartbeatCheck), null, TimeSpan.FromSeconds(0),
+                _ => Task.Run(HeartbeatCheck),
+                null, TimeSpan.FromSeconds(0),
                 TimeSpan.FromMinutes(SignalROrleansConstants.ServerHeartbeatPulseInMinutes));
 
             var allMessageObserver = new AllMessageObserver(ProcessAllMessage);
@@ -100,6 +113,13 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 "Initialization complete - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}",
                 _instanceId, _hubName, _serverId);
         }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, 
+                "Failed to initialize Orleans HubLifetimeManager {hubName} (serverId: {serverId})",
+                _hubName, _serverId);
+            throw;
+        }
         finally
         {
             _streamSetupLock.Release();
@@ -108,9 +128,12 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
     private Task ProcessAllMessage(AllMessage allMessage)
     {
-        var allTasks = new List<Task>();
-        var payload = allMessage.Message!;
+        if (allMessage.Message == null) 
+            return Task.CompletedTask;
         
+        var payload = allMessage.Message;
+        var allTasks = new List<Task>();
+
         var connections = _connections.Values.ToList();
         
         foreach (var connection in connections)
@@ -119,7 +142,10 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 continue;
 
             if (allMessage.ExcludedIds == null || !allMessage.ExcludedIds.Contains(connection.ConnectionId))
-                allTasks.Add(SendLocal(connection, new ClientNotification(payload.Target, payload.Arguments!.ToStrings())));
+            {
+                var task = SendLocal(connection, new ClientNotification(payload.Target, payload.Arguments!.ToStrings()));
+                allTasks.Add(task);
+            }
         }
 
         return Task.WhenAll(allTasks);
@@ -127,20 +153,24 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
 
     private Task ProcessServerMessage(ClientMessage clientMessage)
     {
-        if (_connections.TryGetValue(clientMessage.ConnectionId, out var connection))
+        // 使用TryGetValue避免KeyNotFoundException
+        if (_connections.TryGetValue(clientMessage.ConnectionId, out var connection) && 
+            !connection.ConnectionAborted.IsCancellationRequested)
         {
             _logger.LogDebug(
-                        "Processing server message - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}, ConnectionId: {ConnectionId}, Available: {ConnectionAvailable}",
-                        _instanceId,
-                        _hubName,
-                        _serverId,
-                        clientMessage.ConnectionId,
-                        connection != null);
+                "Processing server message - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}, ConnectionId: {ConnectionId}, Available: {ConnectionAvailable}",
+                _instanceId,
+                _hubName,
+                _serverId,
+                clientMessage.ConnectionId,
+                connection != null);
+
             return SendLocal(connection, clientMessage.Message);
         }
+        
         return Task.CompletedTask;
     }
-
+    
     private bool IsIpRateLimited(string ipAddress)
     {
         var now = DateTime.UtcNow;
@@ -166,57 +196,69 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         return false;
     }
 
+    private async Task<bool> TryAcquireTransferSlot(string connectionId)
+    {
+        // 如果已存在，则已获取槽位
+        if (_activeTransfers.TryGetValue(connectionId, out _))
+            return true;
+            
+        // 如果活动传输数已达上限，则拒绝新的传输
+        if (_activeTransfers.Count >= _maxParallelTransfers)
+            return false;
+            
+        // 尝试添加新传输
+        return _activeTransfers.TryAdd(connectionId, 1);
+    }
+    
+    private void ReleaseTransferSlot(string connectionId)
+    {
+        _activeTransfers.TryRemove(connectionId, out _);
+    }
+
     public override async Task OnConnectedAsync(HubConnectionContext connection)
     {
+        if (connection == null)
+            throw new ArgumentNullException(nameof(connection));
+            
         await EnsureStreamSetup();
 
+        var connectionId = connection.ConnectionId;
+        
         try
         {
-            _connections.TryAdd(connection.ConnectionId, connection);
-            var httpContext = connection.GetHttpContext();
-            var ipAddress = httpContext?.Connection?.RemoteIpAddress?.ToString() ?? "Unknown IP";
+            // 如果无法获取传输槽位，则延迟处理
+            if (!(await TryAcquireTransferSlot(connectionId)))
+            {
+                _logger.LogWarning("Connection processing delayed due to high load: {connectionId}", connectionId);
+                await Task.Delay(100);
+                
+                // 再次尝试获取槽位
+                if (!(await TryAcquireTransferSlot(connectionId)))
+                {
+                    throw new HubException("Server is currently handling too many connections. Please try again later.");
+                }
+            }
             
-            // if (IsIpRateLimited(ipAddress))
-            // {
-            //     _logger.LogWarning(
-            //         "Connection rejected due to rate limiting - Instance: {InstanceId}, IP: {IpAddress}, ConnectionId: {ConnectionId}",
-            //         _instanceId,
-            //         ipAddress,
-            //         connection.ConnectionId);
-            //         
-            //     throw new HubException($"Too many connection attempts. Please wait a moment before trying again.");
-            // }
+            // 添加到本地连接字典
+            if (!_connections.TryAdd(connectionId, connection))
+            {
+                _logger.LogWarning("Connection {connectionId} already exists in dictionary", connectionId);
+                var existingConnection = _connections[connectionId];
+                // 如果连接已中止，则用新连接替换
+                if (existingConnection.ConnectionAborted.IsCancellationRequested)
+                {
+                    _connections[connectionId] = connection;
+                }
+            }
+            
+            
 
-            var userAgent = httpContext?.Request?.Headers["User-Agent"].ToString() ?? "Unknown Agent";
-            
-            _logger.LogDebug(
-                "Orleans Hub - New client connection - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}, ConnectionId: {ConnectionId}, IP: {IpAddress}, UserAgent: {UserAgent}, Identity: {UserIdentity}, IsAuthenticated: {IsAuthenticated}, UserIdentifier: {UserIdentifier}, Items: {ItemsCount}, Claims: {Claims}",
-                _instanceId,
-                _hubName,
-                _serverId,
-                connection.ConnectionId,
-                ipAddress,
-                userAgent,
-                connection.User?.Identity?.Name ?? "Anonymous",
-                connection.User?.Identity?.IsAuthenticated ?? false,
-                connection.UserIdentifier ?? "None",
-                connection.Items.Count,
-                connection.User?.Claims != null 
-                    ? string.Join(", ", connection.User.Claims.Select(c => $"{c.Type}: {c.Value}"))
-                    : "No claims");
-            
-            var client = _clusterClient.GetClientGrain(_hubName, connection.ConnectionId);
-
-            _logger.LogDebug(
-                "Orleans Hub - Client grain - Instance: {InstanceId}, Hub: {HubName}, ServerId: {ServerId}, ConnectionId: {ConnectionId}",
-                _instanceId,
-                _hubName,
-                _serverId,
-                connection.ConnectionId);
-            
+            // 告知 Orleans Grain 系统新连接已建立
+            var client = _clusterClient.GetClientGrain(_hubName, connectionId);
             await client.OnConnect(_serverId);
 
-            if (connection!.User!.Identity!.IsAuthenticated)
+            // 如果用户已验证，则添加到用户组
+            if (connection.User?.Identity?.IsAuthenticated == true && !string.IsNullOrEmpty(connection.UserIdentifier))
             {
                 _logger.LogDebug(
                     "Orleans Hub - Authenticated user connected - Instance: {InstanceId}, Hub: {HubName}, ConnectionId: {ConnectionId}, User: {UserIdentity}, UserIdentifier: {UserIdentifier}",
@@ -226,9 +268,12 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                     connection.User.Identity.Name,
                     connection.UserIdentifier);
 
-                var user = _clusterClient.GetUserGrain(_hubName, connection.UserIdentifier!);
-                await user.Add(connection.ConnectionId);
+                var user = _clusterClient.GetUserGrain(_hubName, connection.UserIdentifier);
+                await user.Add(connectionId);
             }
+            
+            _logger.LogInformation("Connection {connectionId} successfully established on hub {hubName} (serverId: {serverId})",
+                connectionId, _hubName, _serverId);
         }
         catch (Exception ex)
         {
@@ -239,13 +284,32 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 _hubName,
                 _serverId);
 
-            _connections.TryRemove(connection!.ConnectionId, out _);
+            // 确保连接从字典中移除
+            _connections.TryRemove(connectionId, out _);
+            
+            // 如果发生错误，尝试通知客户端并关闭连接
+            try
+            {
+                await connection.WriteAsync(new CloseMessage("Connection failed due to server error"));
+            }
+            catch (Exception writeEx)
+            {
+                _logger.LogError(writeEx, "Failed to write error message to connection {connectionId}", connectionId);
+            }
+            
             throw;
+        }
+        finally
+        {
+            // 释放传输槽位
+            ReleaseTransferSlot(connectionId);
         }
     }
 
     public override async Task OnDisconnectedAsync(HubConnectionContext connection)
     {
+        var connectionId = connection.ConnectionId;
+        
         try
         {
             _logger.LogDebug(
@@ -254,12 +318,31 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 _hubName,
                 _serverId,
                 connection.ConnectionId);
-            var client = _clusterClient.GetClientGrain(_hubName, connection.ConnectionId);
+
+            // 从本地连接字典中移除
+            _connections.TryRemove(connectionId, out _);
+
+            // 通知 Orleans Grain 系统连接已断开
+            var client = _clusterClient.GetClientGrain(_hubName, connectionId);
             await client.OnDisconnect("hub-disconnect");
+            
+            // 如果用户已验证，则从用户组中移除
+            if (connection.User?.Identity?.IsAuthenticated == true && !string.IsNullOrEmpty(connection.UserIdentifier))
+            {
+                var user = _clusterClient.GetUserGrain(_hubName, connection.UserIdentifier);
+                await user.Remove(connectionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, 
+                "Error while processing disconnection {connectionId} on hub {hubName} (serverId: {serverId})",
+                connectionId, _hubName, _serverId);
         }
         finally
         {
-            _connections.TryRemove(connection.ConnectionId, out _);
+            // 释放传输槽位
+            ReleaseTransferSlot(connectionId);
         }
     }
 
