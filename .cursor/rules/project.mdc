@@ -1,0 +1,13 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# 基于Orleans的C#项目
+
+- Grain内部请使用单线程
+- 请基于C#与Orleans的最佳实践
+- 请尽量不引入新依赖
+- 请保持系统复杂度够低
+
