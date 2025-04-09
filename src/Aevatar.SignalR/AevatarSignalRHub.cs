@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using Aevatar.Core.Abstractions;
+using Aevatar.Core.Abstractions.Extensions;
 using Aevatar.SignalR.GAgents;
+using Aevatar.SignalR.Grains;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 
@@ -11,12 +13,37 @@ namespace Aevatar.SignalR;
 public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 {
     private readonly IGAgentFactory _gAgentFactory;
+    private readonly IGrainFactory _grainFactory;
     private readonly ILogger<AevatarSignalRHub> _logger;
 
-    public AevatarSignalRHub(IGAgentFactory gAgentFactory, ILogger<AevatarSignalRHub> logger)
+    public AevatarSignalRHub(IGAgentFactory gAgentFactory, IGrainFactory grainFactory,
+        ILogger<AevatarSignalRHub> logger)
     {
         _gAgentFactory = gAgentFactory;
+        _grainFactory = grainFactory;
         _logger = logger;
+    }
+
+    public async Task<GrainId> InitializeAsync(GrainId grainId)
+    {
+        _logger.LogInformation($"InitializeAsync: {grainId}");
+        using var scope = new ActivityScope(nameof(InitializeAsync));
+
+        var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(grainId.ToString().ToGuid());
+        var signalRGAgentGrainId = signalRGAgent.GetGrainId();
+        var signalRGAgentInitGrain = _grainFactory.GetGrain<ISignalRGAgentInitGrain>(signalRGAgentGrainId.GetGuidKey());
+
+        try
+        {
+            await signalRGAgentInitGrain.InitializeSignalRGAgentAsync(grainId, signalRGAgent).ConfigureAwait(false);
+            _logger.LogInformation($"SignalRGAgent {signalRGAgentGrainId} initialized successfully");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Failed to initialize SignalRGAgent {signalRGAgentGrainId}");
+        }
+
+        return signalRGAgentGrainId;
     }
 
     public async Task<GrainId?> PublishEventAsync(GrainId grainId, string eventTypeName, string eventJson)
@@ -24,14 +51,12 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
         _logger.LogInformation($"PublishEventAsync: {grainId} \n{eventTypeName} \n{eventJson}");
         using var _ = new ActivityScope(nameof(PublishEventAsync));
 
-        var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
-        if (parentGAgent == null || signalRGAgent == null) return null;
+        var signalRGAgentGrainId = await InitializeAsync(grainId);
+        var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentGrainId.GetGuidKey());
 
         var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, true);
-        await parentGAgent.RegisterAsync(signalRGAgent);
-        _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
         await signalRGAgent.PublishEventAsync(DeserializeEvent(eventTypeName, eventJson), connectionId);
         return signalRGAgent.GetGrainId();
     }
@@ -42,54 +67,18 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
 
         using var _ = new ActivityScope(nameof(SubscribeAsync));
 
-        var (parentGAgent, signalRGAgent) = await InitializeGroupMembers(grainId);
-        if (parentGAgent == null || signalRGAgent == null) return null;
+        var signalRGAgentGrainId = await InitializeAsync(grainId);
+        var signalRGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(signalRGAgentGrainId.GetGuidKey());
 
         var connectionId = GetConnectionId();
         _logger.LogInformation($"ConnectionId: {connectionId}");
         await AddConnectionIdIfNeeded(signalRGAgent, connectionId, false);
-        await parentGAgent.RegisterAsync(signalRGAgent);
-        _logger.LogInformation($"{signalRGAgent.GetGrainId().ToString()} registered.");
         await signalRGAgent.PublishEventAsync(DeserializeEvent(eventTypeName, eventJson), connectionId);
         return signalRGAgent.GetGrainId();
     }
 
     private static EventBase DeserializeEvent(string eventTypeName, string eventJson) =>
         new EventDeserializer().DeserializeEvent(eventJson, eventTypeName);
-
-    private async Task<(IGAgent? ParentGAgent, ISignalRGAgent? SignalRGAgent)> InitializeGroupMembers(
-        GrainId grainId)
-    {
-        var targetGAgent = await _gAgentFactory.GetGAgentAsync(grainId);
-        var parentGrainId = await targetGAgent.GetParentAsync();
-        if (parentGrainId.IsDefault)
-        {
-            var signalRParentGAgent = await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>();
-            var gAgent = await _gAgentFactory.GetGAgentAsync(grainId);
-            await signalRParentGAgent.RegisterAsync(gAgent);
-            return (signalRParentGAgent, signalRParentGAgent);
-        }
-
-        var parentGAgent = await _gAgentFactory.GetGAgentAsync(parentGrainId);
-        if (parentGrainId.Type == GrainTypeCache.Get(typeof(SignalRGAgent)))
-        {
-            return (parentGAgent, await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(parentGrainId.GetGuidKey()));
-        }
-
-        var signalRGAgent = await GetOrCreateSignalRGAgentAsync(parentGAgent);
-        return (parentGAgent, signalRGAgent);
-    }
-
-    private async Task<ISignalRGAgent> GetOrCreateSignalRGAgentAsync(IGAgent parentGAgent)
-    {
-        var siblings = await parentGAgent.GetChildrenAsync();
-        var existingGAgentId = siblings.FirstOrDefault(id =>
-            id.Type == GrainTypeCache.Get(typeof(SignalRGAgent)));
-
-        return existingGAgentId.IsDefault is false
-            ? await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>(existingGAgentId.GetGuidKey())
-            : await _gAgentFactory.GetGAgentAsync<ISignalRGAgent>();
-    }
 
     private string GetConnectionId() => Context?.ConnectionId ?? string.Empty;
 
@@ -132,7 +121,7 @@ public class AevatarSignalRHub : Hub, IAevatarSignalRHub
             Context.User?.Identity?.Name ?? "Anonymous",
             Context.User?.Identity?.IsAuthenticated ?? false,
             Context.Items.Count,
-            Context.User?.Claims != null 
+            Context.User?.Claims != null
                 ? string.Join(", ", Context.User.Claims.Select(c => $"{c.Type}: {c.Value}"))
                 : "No claims");
 

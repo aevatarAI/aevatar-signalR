@@ -24,12 +24,21 @@ connection.On<string>("ReceiveResponse", (message) =>
 
 await connection.StartAsync();
 
+await InitializeAsync();
 await PublishEventAsync("PublishEventAsync");
 await PublishEventAsync("SubscribeAsync");
 
 while (true)
 {
     await Task.Delay(1000);
+}
+
+async Task InitializeAsync()
+{
+    var grainId = GrainId.Create("SignalRSample.GAgents.signalR",
+        "test".ToGuid().ToString("N"));
+    var signalRGAgentGrainId = await connection.InvokeAsync<GrainId>("InitializeAsync", grainId);
+    Console.WriteLine($"SignalRGAgentGrainId: {signalRGAgentGrainId.ToString()}");
 }
 
 async Task PublishEventAsync(string methodName)

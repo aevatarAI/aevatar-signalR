@@ -176,13 +176,6 @@ public class SignalRGAgent :
         });
     }
 
-    // [AllEventHandler]
-    // public async Task ResponseErrorToSignalRAsync(EventWrapperBase eventWrapperBase)
-    // {
-    //     Logger.LogInformation($"ResponseErrorToSignalRAsync: {eventWrapperBase}");
-    //
-    // }
-
     protected override void GAgentTransitionState(SignalRGAgentState state,
         StateLogEventBase<SignalRStateLogEvent> @event)
     {

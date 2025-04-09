@@ -10,12 +10,14 @@ namespace Aevatar.SignalR.Tests;
 public sealed class SignalRGAgentTests : AevatarSignalRTestBase
 {
     private readonly IGAgentFactory _gAgentFactory;
+    private readonly IGrainFactory _grainFactory;
     private readonly AevatarSignalRHub _signalRHub;
 
     public SignalRGAgentTests()
     {
         _gAgentFactory = GetRequiredService<IGAgentFactory>();
-        _signalRHub = new AevatarSignalRHub(_gAgentFactory, null);
+        _grainFactory = GetRequiredService<IGrainFactory>();
+        _signalRHub = new AevatarSignalRHub(_gAgentFactory, _grainFactory, null);
     }
 
     [Fact]
