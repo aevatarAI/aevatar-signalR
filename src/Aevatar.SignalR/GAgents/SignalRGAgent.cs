@@ -186,16 +186,25 @@ public class SignalRGAgent :
     protected override void GAgentTransitionState(SignalRGAgentState state,
         StateLogEventBase<SignalRStateLogEvent> @event)
     {
+        Logger.LogDebug("[GrainId {GrainId}] GAgentTransitionState",
+            this.GetGrainId().ToString());
         switch (@event)
         {
             case AddConnectionIdStateLogEvent addConnectionIdStateLogEvent:
+                Logger.LogDebug("Adding connectionId: {ConnectionId}",
+                    addConnectionIdStateLogEvent.ConnectionId);
                 State.ConnectionIds[addConnectionIdStateLogEvent.ConnectionId] =
                     addConnectionIdStateLogEvent.FireAndForget;
                 break;
             case RemoveConnectionIdStateLogEvent removeConnectionIdStateLogEvent:
+                Logger.LogDebug("Removing connectionId: {ConnectionId}",
+                    removeConnectionIdStateLogEvent.ConnectionId);
                 State.ConnectionIds.Remove(removeConnectionIdStateLogEvent.ConnectionId);
                 break;
             case MapCorrelationIdToConnectionIdStateLogEvent mapCorrelationIdToConnectionIdStateLogEvent:
+                Logger.LogDebug("Mapping correlationId to connectionId: {@CorrelationId} {ConnectionId}",
+                    mapCorrelationIdToConnectionIdStateLogEvent.CorrelationId,
+                    mapCorrelationIdToConnectionIdStateLogEvent.ConnectionId);
                 State.ConnectionIdMap[mapCorrelationIdToConnectionIdStateLogEvent.CorrelationId] =
                     mapCorrelationIdToConnectionIdStateLogEvent.ConnectionId;
                 break;
