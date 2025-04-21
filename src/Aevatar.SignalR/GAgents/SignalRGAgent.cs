@@ -130,6 +130,13 @@ public class SignalRGAgent :
 
     public async Task AddConnectionIdAsync(string connectionId, bool fireAndForget)
     {
+        if (State.ConnectionIds.ContainsKey(connectionId))
+        {
+            return;
+        }
+        
+        Logger.LogDebug("[AddConnectionIdAsync] Adding connectionId: {ConnectionId}", connectionId);
+
         RaiseEvent(new AddConnectionIdStateLogEvent
         {
             ConnectionId = connectionId,
@@ -140,6 +147,13 @@ public class SignalRGAgent :
 
     public async Task RemoveConnectionIdAsync(string connectionId)
     {
+        if (!State.ConnectionIds.ContainsKey(connectionId))
+        {
+            return;
+        }
+
+        Logger.LogDebug("[RemoveConnectionIdAsync] Removing connectionId: {ConnectionId}", connectionId);
+
         RaiseEvent(new RemoveConnectionIdStateLogEvent
         {
             ConnectionId = connectionId
